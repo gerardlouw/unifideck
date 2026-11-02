@@ -40,7 +40,12 @@ from typing import Any
 
 from unifideck.core.types.domain import Game
 
-from .install_state import index_by_uid, normalize_uid, variant_install_rows
+from .install_state import (
+    index_by_uid,
+    install_row_for,
+    normalize_uid,
+    variant_install_rows,
+)
 from .ownership import (
     AccountFacts,
     InstalledGame,
@@ -133,6 +138,7 @@ def _game_from(
     uid: str | None = None,
     presumed: bool = False,
     versions_installed: int = 0,
+    title_override: str | None = None,
 ) -> Game | None:
     # An explicit uid wins: an installed game the catalog does not describe
     # still has one, and deriving it from a missing entry would drop the
@@ -144,7 +150,12 @@ def _game_from(
         logger.info("[Battlenet] skipping %s — catalog has no install uid", program)
         return None
 
-    name = catalog.display_name(program) or (installed.name if installed else None) or program
+    name = (
+        title_override
+        or catalog.display_name(program)
+        or (installed.name if installed else None)
+        or program
+    )
     version_family, client_selects = _version_family_and_client_selects(
         entry, installed, versions_installed,
     )
@@ -209,7 +220,7 @@ def record_families(id_map: Any, games: list[Game]) -> int:
 
 
 def family_from_catalog(catalog: MergedCatalog, uid: str) -> str | None:
-    """The program id (family) whose install uid is ``uid``, or None.
+    """The launch family for ``uid``, or None.
 
     The catalog maps family -> uid, so going the other way means scanning.
     Only used on the install path, where a title may not have been through a
@@ -220,6 +231,9 @@ def family_from_catalog(catalog: MergedCatalog, uid: str) -> str | None:
         candidate = entry.uid_for()
         if candidate and normalize_uid(candidate) == wanted:
             return entry.program_id
+    entry = catalog.entry_for_uid(uid)
+    if entry is not None:
+        return entry.launch_family_for(uid) or entry.program_id
     return None
 
 
@@ -321,17 +335,33 @@ def build_library(
     by_uid = index_by_uid(installed)
     games = _granted_games(granted, catalog, by_uid, launcher_path, presumed=presumed)
     seen = {normalize_uid(g.store_game_id) for g in games}
-    # A tile that matched a variant has consumed that install; without this
-    # the orphan sweep re-adds Classic Era as a second World of Warcraft.
     seen |= {
         normalize_uid(str(g.metadata["installed_uid"]))
         for g in games if g.metadata and g.metadata.get("installed_uid")
     }
+    # Every uid the matched catalog entries *can* install as is consumed,
+    # so the orphan sweep cannot re-add a variant the granted tiles already
+    # cover.  Without this, a second installed WoW version (Classic Era,
+    # Forever) leaks back as a bare-named duplicate tile.
+    for game in games:
+        entry = catalog.entry_for_uid(game.store_game_id)
+        if entry:
+            seen |= {normalize_uid(u) for u in entry.known_uids()}
     games.extend(_orphan_installed(installed, catalog, seen, launcher_path))
     return games
 
 
-def _granted_game(
+def _version_name(
+    entry: CatalogEntry, catalog: MergedCatalog, uid: str,
+) -> str | None:
+    """Per-version display name from the catalog, or ``None``."""
+    key = entry.name_key_for(uid)
+    if key and key != entry.name_key:
+        return catalog.text(key)
+    return None
+
+
+def _granted_games_for_program(
     program: str,
     products: frozenset[Any],
     catalog: MergedCatalog,
@@ -339,26 +369,62 @@ def _granted_game(
     launcher_path: str,
     *,
     presumed: bool,
-) -> Game | None:
+) -> list[Game]:
+    """Games for one granted program — one per installed family.
+
+    A program with no installed versions, or with only one installed family,
+    produces a single Game keyed on the program's retail uid (unchanged from
+    before multi-family support).  A program with multiple installed families
+    produces one Game per family, each keyed on the family's canonical uid.
+    """
     entry = catalog.entry_for(program)
     if presumed and entry is not None and not entry.runs_on_windows():
         # A presumption must not invent a tile for a title the client will
         # not even install here (mobile- and macOS-only records exist).
         logger.info("[Battlenet] skipping %s — catalog lists no Windows build", program)
-        return None
+        return []
     uid = entry.uid_for() if entry else None
     candidates = entry.known_uids() if entry else ((uid,) if uid else ())
     rows = variant_install_rows(by_uid, candidates)
-    return _game_from(
-        program,
-        entry,
-        catalog,
-        max(rows, key=lambda r: (r.is_ready, r.last_played_ms or 0)) if rows else None,
-        versions_installed=sum(1 for row in rows if row.is_ready),
-        free_to_play=any(p.is_free_to_play for p in products),
-        launcher_path=launcher_path,
-        presumed=presumed,
-    )
+    free_to_play = any(p.is_free_to_play for p in products)
+
+    # How many distinct launch families are installed?
+    families: dict[str | None, str] = {}
+    if entry and rows:
+        installed_uids = frozenset(
+            normalize_uid(r.uid) for r in rows if r.uid and r.is_ready
+        )
+        families = entry.installed_families(installed_uids)
+
+    if len(families) <= 1:
+        # Single family (or nothing installed): one tile on the program uid.
+        best = max(rows, key=lambda r: (r.is_ready, r.last_played_ms or 0)) if rows else None
+        game = _game_from(
+            program, entry, catalog, best,
+            versions_installed=sum(1 for r in rows if r.is_ready),
+            free_to_play=free_to_play,
+            launcher_path=launcher_path,
+            presumed=presumed,
+        )
+        return [game] if game else []
+
+    games: list[Game] = []
+    for family, canonical_uid in families.items():
+        row = install_row_for(by_uid, canonical_uid)
+        if row is None:
+            continue
+        game = _game_from(
+            program, entry, catalog, row,
+            uid=canonical_uid,
+            versions_installed=1,
+            free_to_play=free_to_play,
+            launcher_path=launcher_path,
+            presumed=presumed,
+            title_override=_version_name(entry, catalog, canonical_uid),
+        )
+        if game is not None:
+            games.append(game)
+    return games
 
 
 def _granted_games(
@@ -379,14 +445,14 @@ def _granted_games(
     games: list[Game] = []
     seen: set[str] = set()
     for program in sorted(granted, key=lambda p: (p in presumed, p)):
-        game = _granted_game(
+        for game in _granted_games_for_program(
             program, granted[program], catalog, by_uid, launcher_path,
             presumed=program in presumed,
-        )
-        if game is None or normalize_uid(game.store_game_id) in seen:
-            continue
-        seen.add(normalize_uid(game.store_game_id))
-        games.append(game)
+        ):
+            if normalize_uid(game.store_game_id) in seen:
+                continue
+            seen.add(normalize_uid(game.store_game_id))
+            games.append(game)
     return games
 
 

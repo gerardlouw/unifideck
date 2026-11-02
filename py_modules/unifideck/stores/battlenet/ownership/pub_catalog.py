@@ -79,6 +79,10 @@ class CatalogEntry:
     # than retail, because ``--exec=launch WoW`` resets the client to
     # ``WoW_retail`` whatever the user had selected.
     type_launch_families: dict[str, str] = field(default_factory=dict)
+    # product type -> catalog string key for the version's display name.
+    # Blizzard uses ``name`` or ``type_name`` inside each ``types`` entry;
+    # both resolve through the catalog's ``strings`` table.
+    type_names: dict[str, str] = field(default_factory=dict)
     genre_key: str | None = None
     handheld_status: tuple[str, ...] = ()
     # Platforms the client will install this title on, e.g. ('win',). The
@@ -115,6 +119,40 @@ class CatalogEntry:
             if type_uid.casefold() == target:
                 return self.type_launch_families.get(product_type)
         return None
+
+    def name_key_for(self, uid: str | None) -> str | None:
+        """The catalog string key for a version's display name, or ``None``.
+
+        Falls back to the program-level ``name_key`` when the version has no
+        per-type name — most single-version titles never carry one.
+        """
+        if not uid:
+            return self.name_key
+        target = uid.casefold()
+        for product_type, type_uid in self.type_uids.items():
+            if type_uid.casefold() == target:
+                found = self.type_names.get(product_type)
+                return found if found else self.name_key
+        return self.name_key
+
+    def installed_families(
+        self, installed_uids: frozenset[str],
+    ) -> dict[str | None, str]:
+        """``{family: canonical_uid}`` for each distinct installed family.
+
+        Returns only families that have at least one installed uid.
+        ``None`` represents the program's own retail family.
+        """
+        result: dict[str | None, str] = {}
+        for product_type, type_uid in self.type_uids.items():
+            if type_uid.casefold() not in installed_uids:
+                continue
+            family = self.type_launch_families.get(product_type)
+            result.setdefault(family, type_uid)
+        retail_uid = self.uid_for()
+        if retail_uid and retail_uid.casefold() in installed_uids:
+            result.setdefault(None, retail_uid)
+        return result
 
     def known_uids(self) -> tuple[str, ...]:
         """Every uid this title can be installed as, the tile's own first.
@@ -254,6 +292,19 @@ def _type_launch_families(base: dict[str, object]) -> dict[str, str]:
     return out
 
 
+def _type_names(base: dict[str, object]) -> dict[str, str]:
+    types = base.get("types")
+    if not isinstance(types, dict):
+        return {}
+    out: dict[str, str] = {}
+    for product_type, cfg in types.items():
+        if isinstance(product_type, str) and isinstance(cfg, dict):
+            name = cfg.get("name") or cfg.get("type_name")
+            if isinstance(name, str) and name:
+                out[product_type] = name
+    return out
+
+
 def _install_uids(fragment: dict[str, object]) -> tuple[str, ...]:
     installs = fragment.get("installs")
     if not isinstance(installs, dict):
@@ -284,6 +335,7 @@ def _entry_from_product(product: object) -> CatalogEntry | None:
         default_product_type=str(base.get("default_product_type") or "retail"),
         type_uids=_type_uids(base),
         type_launch_families=_type_launch_families(base),
+        type_names=_type_names(base),
         genre_key=base.get("genre") if isinstance(base.get("genre"), str) else None,
         handheld_status=tuple(h for h in (handheld or []) if isinstance(h, str)),
         supported_platforms=tuple(p for p in (platforms or []) if isinstance(p, str)),
@@ -305,6 +357,7 @@ def _absorb_entry(catalog: MergedCatalog, entry: CatalogEntry) -> None:
         return
     merged_types = {**entry.type_uids, **existing.type_uids}
     merged_families = {**entry.type_launch_families, **existing.type_launch_families}
+    merged_names = {**entry.type_names, **existing.type_names}
     catalog.entries[entry.product_id] = CatalogEntry(
         product_id=existing.product_id,
         program_id=existing.program_id or entry.program_id,
@@ -313,6 +366,7 @@ def _absorb_entry(catalog: MergedCatalog, entry: CatalogEntry) -> None:
         default_product_type=existing.default_product_type or entry.default_product_type,
         type_uids=merged_types,
         type_launch_families=merged_families,
+        type_names=merged_names,
         genre_key=existing.genre_key or entry.genre_key,
         handheld_status=existing.handheld_status or entry.handheld_status,
         supported_platforms=existing.supported_platforms or entry.supported_platforms,

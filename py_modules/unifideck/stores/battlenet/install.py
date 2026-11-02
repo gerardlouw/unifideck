@@ -173,6 +173,14 @@ class BattlenetInstaller:
             )
         if not self._prefixes.auth_ready():
             return _failed(game_id, *self._auth_not_ready_reason())
+        # Per-family tiles (WoW Modern / Classic / Forever) share a prefix.
+        # If a sibling already has one, reuse it rather than creating a new
+        # one — the Blizzard client manages all versions inside the same
+        # prefix, and resetting it would delete the sibling's install.
+        shared = self._id_map.resolve_prefix(game_id)
+        if shared is not None and shared.is_dir():
+            self._id_map.merge(game_id, prefix_path=str(shared))
+            return PreparedInstall(prefix=shared)
         target = await self._place_prefix(game_id, install_path)
         prefix = await self._prefixes.create_game_prefix(game_id, target)
         if prefix is None:
@@ -341,24 +349,27 @@ class BattlenetInstaller:
         return target
 
     async def ensure_family(self, game_id: str) -> bool:
-        """True once a family code for ``game_id`` is in the id map.
+        """True once a family code and program for ``game_id`` are in the id map.
 
         Normally already there — ``get_library`` records the whole library on
         every sync. This covers the install-without-a-recent-sync case by
         re-reading the catalog for just this title, which costs one catalog
         parse rather than a full library build.
         """
-        if self._id_map.resolve_family(game_id):
+        record = self._id_map.get(game_id)
+        if record and record.family and record.program:
             return True
         drive_c = paths.drive_c(self._prefixes.auth_prefix)
         if drive_c is None:
-            return False
+            return record is not None and record.family is not None
         catalog = await asyncio.to_thread(read_catalog, drive_c)
-        family = library_mod.family_from_catalog(catalog, game_id)
+        family = (record.family if record else None) or library_mod.family_from_catalog(catalog, game_id)
         if family is None:
             logger.error("[Battlenet] no family code in the catalog for %s", game_id)
             return False
-        self._id_map.merge(game_id, family=family)
+        entry = catalog.entry_for_uid(game_id)
+        program = entry.program_id if entry else None
+        self._id_map.merge(game_id, family=family, **({"program": program} if program else {}))
         logger.info(
             "[Battlenet] resolved family %s for %s at install time", family, game_id,
         )

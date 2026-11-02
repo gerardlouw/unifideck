@@ -413,7 +413,13 @@ class BattlenetStore(WrapperSessionHooks, StoreBase):
         )
 
     async def uninstall_game(self, game_id: str, **kwargs: Any) -> Result:
-        """Remove the game by removing its prefix — the install lives inside."""
+        """Remove the game by removing its prefix — the install lives inside.
+
+        Per-family tiles (WoW Modern / Classic / Forever) share a prefix, so
+        deleting it would destroy every sibling's install.  For those, the
+        Battle.net client is opened and the user uninstalls the version from
+        inside the client — the same manual flow as install.
+        """
         delete_prefix = bool(kwargs.get("delete_prefix", True))
         prefix = self.id_map.resolve_prefix(game_id)
         if prefix is None:
@@ -423,6 +429,8 @@ class BattlenetStore(WrapperSessionHooks, StoreBase):
                 error="No recorded prefix for this game",
                 error_code="prefix_unknown",
             )
+        if self._prefix_has_siblings(game_id):
+            return await self._uninstall_shared(game_id, prefix)
         # Last chance to keep this prefix's session. The client rotates the
         # token on every run, so a played game usually holds a NEWER one than
         # the auth prefix; deleting it uncaptured strands auth on a stale
@@ -440,6 +448,55 @@ class BattlenetStore(WrapperSessionHooks, StoreBase):
 
         await self._emit(Events.GAME_UNINSTALLED, store=self.store_name, game_id=game_id)
         return Result(success=True, store=self.store_name)
+
+    async def _uninstall_shared(self, game_id: str, prefix: Path) -> Result:
+        """Uninstall a version from a shared prefix via the Battle.net client.
+
+        Opens the client so the user can uninstall the version manually, then
+        polls ``product.db`` until the entry is gone.
+        """
+        from unifideck.services.download.wrapper_signals import signal_install_launch
+
+        from .install_watch import BattlenetInstallProbe
+
+        await signal_install_launch(self._bus, self.store_name, game_id)
+        probe = BattlenetInstallProbe(game_id, prefix)
+        if not await self._wait_for_removal(probe):
+            return Result(
+                success=False,
+                store=self.store_name,
+                error="The game was not uninstalled in Battle.net",
+                error_code="no_uninstall_detected",
+            )
+        self.id_map.forget(game_id)
+        from unifideck.core.types.events import Events
+
+        await self._emit(Events.GAME_UNINSTALLED, store=self.store_name, game_id=game_id)
+        return Result(success=True, store=self.store_name)
+
+    @staticmethod
+    async def _wait_for_removal(
+        probe: Any,
+        timeout_s: float = 7200.0,
+        poll_s: float = 5.0,
+    ) -> bool:
+        """Poll until the game's entry is gone from ``product.db``."""
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        while asyncio.get_event_loop().time() < deadline:
+            if probe.row() is None:
+                return True
+            await asyncio.sleep(poll_s)
+        return False
+
+    def _prefix_has_siblings(self, game_id: str) -> bool:
+        """True when another game of the same program shares a prefix."""
+        record = self.id_map.get(game_id)
+        if not record or not record.program:
+            return False
+        return any(
+            uid != game_id and peer.program == record.program and peer.prefix_path
+            for uid, peer in self.id_map.all_records().items()
+        )
 
     async def update_game(self, game_id: str, **kwargs: Any) -> InstallResult:
         """Updates are client-driven, same shape as install.

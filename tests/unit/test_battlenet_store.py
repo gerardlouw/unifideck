@@ -479,16 +479,20 @@ def test_retail_keeps_the_program_id_and_launches_itself() -> None:
     assert games[0].metadata["client_selects"] is False
 
 
-def test_two_installed_versions_hand_the_choice_to_the_client() -> None:
-    """With Retail and Classic both on disk, the user picks in the client."""
+def test_two_installed_families_produce_separate_tiles() -> None:
+    """Retail and Classic are different families — one tile each."""
     games = build_library(
         _wow_versions_catalog(), AccountFacts(),
         {"wow": _ready("wow", last_played_ms=1),
          "wow_classic_era": _ready("wow_classic_era", last_played_ms=9)},
         launcher_path=LAUNCHER,
     )
-    assert len(games) == 1
-    assert games[0].metadata["client_selects"] is True
+    uids = {g.store_game_id for g in games}
+    assert uids == {"wow", "wow_classic_era"}
+    retail = next(g for g in games if g.store_game_id == "wow")
+    classic = next(g for g in games if g.store_game_id == "wow_classic_era")
+    assert retail.metadata["family"] == "WoW"
+    assert classic.metadata["family"] == "WoWC"
 
 
 def test_a_title_with_nothing_installed_keeps_its_program_id() -> None:
@@ -605,6 +609,92 @@ def test_the_most_recently_played_version_wins_when_several_are_installed() -> N
     games = build_library(_wow_catalog(), AccountFacts(), installed, launcher_path=LAUNCHER)
     assert [g.store_game_id for g in games] == ["wow"]
     assert games[0].metadata["installed_uid"] == "wow_classic_era"
+
+
+def _wow_three_families_catalog() -> Any:
+    """WoW with retail, Classic (WoWC) and Forever (WoWF) — three families."""
+    return merge_fragments(iter([{
+        "fragment_id": "wow",
+        "program_configuration": {"WoW": {"run_each_rule": [{
+            "match": {"game_account": {"program_id": "WoW"}},
+            "actions": [{"add_product": {"product_id": {"id": "WoW", "type": "retail"}}}],
+        }]}},
+        "installs": {"wow": {}, "wow_classic_era": {}, "wowf": {}},
+        "products": [{"id": "WoW", "base": {
+            "program_id": "WoW", "name": "wow#N",
+            "types": {
+                "retail": {"uid": "wow"},
+                "wow_classic_era": {
+                    "uid": "wow_classic_era", "override_product_id": "WoWC",
+                    "name": "wow#CLASSIC",
+                },
+                "wowf": {
+                    "uid": "wowf", "override_product_id": "WoWF",
+                    "name": "wow#FOREVER",
+                },
+            }}}],
+        "strings": {"default": {
+            "wow#N": "World of Warcraft",
+            "wow#CLASSIC": "World of Warcraft Classic",
+            "wow#FOREVER": "WoW: Forever",
+        }},
+    }]))
+
+
+def test_three_installed_families_produce_three_tiles() -> None:
+    games = build_library(
+        _wow_three_families_catalog(), AccountFacts(),
+        {"wow": _ready("wow"), "wow_classic_era": _ready("wow_classic_era"),
+         "wowf": _ready("wowf")},
+        launcher_path=LAUNCHER,
+    )
+    uids = {g.store_game_id for g in games}
+    assert uids == {"wow", "wow_classic_era", "wowf"}
+
+
+def test_per_family_tiles_carry_version_specific_names() -> None:
+    games = build_library(
+        _wow_three_families_catalog(), AccountFacts(),
+        {"wow": _ready("wow"), "wowf": _ready("wowf")},
+        launcher_path=LAUNCHER,
+    )
+    by_uid = {g.store_game_id: g for g in games}
+    assert by_uid["wow"].title == "World of Warcraft"
+    assert by_uid["wowf"].title == "WoW: Forever"
+
+
+def test_same_family_versions_collapse_to_one_tile() -> None:
+    """wow_classic and wow_classic_era share family WoWC — one tile."""
+    games = build_library(
+        _wow_versions_catalog(), AccountFacts(),
+        {"wow_classic": _ready("wow_classic"),
+         "wow_classic_era": _ready("wow_classic_era")},
+        launcher_path=LAUNCHER,
+    )
+    classic_tiles = [g for g in games if g.metadata["family"] == "WoWC"]
+    assert len(classic_tiles) == 1
+
+
+def test_multi_family_tiles_are_not_re_added_as_orphans() -> None:
+    """The orphan sweep must not duplicate per-family tiles."""
+    games = build_library(
+        _wow_three_families_catalog(), AccountFacts(),
+        {"wow": _ready("wow"), "wowf": _ready("wowf")},
+        launcher_path=LAUNCHER,
+    )
+    wowf_tiles = [g for g in games if g.store_game_id == "wowf"]
+    assert len(wowf_tiles) == 1
+
+
+def test_single_installed_version_stays_on_the_program_uid() -> None:
+    """One version -> one tile keyed on the program's retail uid, not split."""
+    games = build_library(
+        _wow_three_families_catalog(), AccountFacts(),
+        {"wowf": _ready("wowf")},
+        launcher_path=LAUNCHER,
+    )
+    assert len(games) == 1
+    assert games[0].store_game_id == "wow"
 
 
 def test_the_catalog_resolves_a_version_for_callers_that_hold_only_a_uid(

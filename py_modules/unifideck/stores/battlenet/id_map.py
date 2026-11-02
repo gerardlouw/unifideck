@@ -39,6 +39,7 @@ class GameRecord:
 
     uid: str
     family: str | None = None
+    program: str | None = None
     prefix_path: str | None = None
     install_path: str | None = None
     exe_path: str | None = None
@@ -123,11 +124,20 @@ class BattlenetIdMap:
         return record.family if record else None
 
     def resolve_prefix(self, uid: str) -> Path | None:
-        """The recorded prefix for a game. Never guesses."""
+        """The recorded prefix for a game, or a sibling's shared prefix.
+
+        Per-family tiles share a single prefix, but only the tile that was
+        installed records ``prefix_path``.  Falls back to a sibling uid of
+        the same ``program``.
+        """
         record = self._records.get(uid)
-        if record is None or not record.prefix_path:
-            return None
-        return Path(record.prefix_path)
+        if record is not None and record.prefix_path:
+            return Path(record.prefix_path)
+        if record is not None and record.program:
+            for peer in self._records.values():
+                if peer.uid != uid and peer.program == record.program and peer.prefix_path:
+                    return Path(peer.prefix_path)
+        return None
 
     def all_prefix_paths(self) -> list[Path]:
         """Every prefix we know about — the sweep set for the prefix bridge."""

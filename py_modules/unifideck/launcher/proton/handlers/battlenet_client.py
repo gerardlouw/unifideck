@@ -184,12 +184,32 @@ def client_selects_version(uid: str) -> bool:
 
 
 def resolve_prefix(uid: str) -> Path | None:
-    """The recorded prefix for a game. Never reconstructed from the uid."""
-    record = _load_id_map().get(uid)
+    """The recorded prefix for a game, or a sibling's shared prefix.
+
+    Per-family tiles (WoW Modern / Classic / Forever) share a single prefix,
+    but only the tile that was installed records ``prefix_path``.  When a
+    variant uid has none, we look for another uid of the same ``program``
+    that does — the prefix is shared by construction.
+    """
+    id_map = _load_id_map()
+    record = id_map.get(uid)
     if not isinstance(record, dict):
         return None
     path = record.get("prefix_path")
-    return Path(path) if isinstance(path, str) and path else None
+    if isinstance(path, str) and path:
+        return Path(path)
+    program = record.get("program")
+    if not isinstance(program, str) or not program:
+        return None
+    for peer_uid, peer in id_map.items():
+        if peer_uid == uid or not isinstance(peer, dict):
+            continue
+        if peer.get("program") != program:
+            continue
+        peer_path = peer.get("prefix_path")
+        if isinstance(peer_path, str) and peer_path:
+            return Path(peer_path)
+    return None
 
 
 def record_launch_ok(uid: str, family: str, when: float) -> None:
